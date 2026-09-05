@@ -72,8 +72,9 @@ def capture_original(output):
 
 
 def check_imports_and_grid():
-    from cont_schrod import generate_grid, shift_to_global_grid
+    from cont_schrod import generate_grid, shift_to_global_grid, hamiltonian, laplacian_DVR
     from functions import dot_states
+    from generate_lattice import clean_lattice_sites
 
     for first in ("functions", "generate_lattice", "quasi_hubbard"):
         subprocess.run([sys.executable, "-c", f"import {first}; import functions; "
@@ -86,6 +87,35 @@ def check_imports_and_grid():
     assert not error
     np.testing.assert_array_equal(shifted, state)
     assert np.isclose(dot_states(state, (0.23, -0.18), state, (0.23, -0.18), 0.1, 0.5) * 0.1 ** 2, 1)
+    rectangular = np.arange(6).reshape(2, 3) + 1j
+    shifted, error = shift_to_global_grid(rectangular, np.arange(3), np.arange(2),
+                                         np.arange(-1, 4), np.arange(-1, 3))
+    assert not error and shifted.shape == (4, 5)
+    np.testing.assert_array_equal(shifted[1:3, 1:4], rectangular)
+    shifted, error = shift_to_global_grid(rectangular, np.arange(3), np.arange(2),
+                                         np.arange(1, 4), np.arange(2))
+    np.testing.assert_array_equal(shifted[:, :2], rectangular[:, 1:])
+    assert not error and not shifted[:, -1].any()
+    shifted, error = shift_to_global_grid(rectangular, np.arange(3), np.arange(2),
+                                         np.arange(10, 13), np.arange(2))
+    assert error and not shifted.any()
+    with np.testing.assert_raises(ValueError):
+        shift_to_global_grid(rectangular, np.arange(3) + 0.1, np.arange(2), np.arange(3), np.arange(2))
+    with np.testing.assert_raises(ValueError):
+        generate_grid((0, 0), 1, 0)
+    with np.testing.assert_raises(ValueError):
+        laplacian_DVR(3, 2, 0.1, 0.2)
+    assert clean_lattice_sites([]).shape == (0, 2)
+    np.testing.assert_array_equal(clean_lattice_sites([[0, 1]]), [[0, 1]])
+    H, _, _ = hamiltonian(np.arange(3) * 0.2, np.arange(2) * 0.2, np.zeros((2, 3)))
+    # Independent separable DVR construction checks signs, flattening and boundary couplings.
+    def kinetic(n):
+        delta = np.arange(n)[:, None] - np.arange(n)[None, :]
+        result = 2 * (-1.) ** delta / (4 * np.pi ** 2 * 0.2 ** 2 * np.where(delta == 0, 1, delta) ** 2)
+        np.fill_diagonal(result, 1 / (12 * 0.2 ** 2))
+        return result
+    expected = np.kron(np.eye(2), kinetic(3)) + np.kron(kinetic(2), np.eye(3))
+    np.testing.assert_allclose(H.toarray(), expected, atol=1e-14)
 
 
 def check_masks():
@@ -117,6 +147,75 @@ def check_masks():
                                        1., 5., np.zeros((4, 2)), np.zeros(4))
 
 
+def embed(basis, sites, spacing, window):
+    """Independent common-grid placement for checks; do not use the production shift helper."""
+    from cont_schrod import generate_grid
+    grids = [generate_grid(site, window, spacing) for site in sites]
+    x0 = min(x[0] for x, _ in grids)
+    y0 = min(y[0] for _, y in grids)
+    nx = round((max(x[-1] for x, _ in grids) - x0) / spacing) + 1
+    ny = round((max(y[-1] for _, y in grids) - y0) / spacing) + 1
+    full = np.zeros((ny, nx, len(sites)), dtype=basis.dtype)
+    for i, (x, y) in enumerate(grids):
+        ix, iy = round((x[0] - x0) / spacing), round((y[0] - y0) / spacing)
+        full[iy:iy + len(y), ix:ix + len(x), i] = basis[:, i].reshape(len(y), len(x))
+    return full.reshape(ny * nx, len(sites)), x0 + np.arange(nx) * spacing, y0 + np.arange(ny) * spacing
+
+
+def check_lowdin():
+    from functions import compute_lowdin, symmetric_orthogonalization
+    sites, basis = np.array([[0., 0.], [1., 0.]]), np.full((16, 2), 0.5)
+    full, _, _ = embed(basis, sites, 0.5, 1.)
+    S = full.T @ full * 0.5 ** 2
+    A, _ = symmetric_orthogonalization(S)
+    np.testing.assert_allclose(A.T @ S @ A, np.eye(2), atol=1e-14)
+    results = [compute_lowdin(i, basis, sites, A, 1., 0.5, return_norm=True) for i in range(2)]
+    cropped, _, _ = embed(np.hstack([state for state, _ in results]), sites, 0.5, 1.)
+    assert np.max(np.abs(cropped.T @ cropped * 0.5 ** 2 - np.eye(2))) > 0.01
+    assert all(0 < norm < 1 for _, norm in results)
+    for S in (np.zeros((2, 2)), np.diag([1., -1.]), np.diag([1., 1e-18])):
+        with np.testing.assert_raises(ValueError):
+            symmetric_orthogonalization(S)
+
+
+def inspect_physical(output):
+    """Compare local representations with an independently assembled common grid."""
+    from scipy.sparse import load_npz
+    from cont_schrod import hamiltonian
+    from potential_functions import potential
+    output = Path(output)
+    params = json.loads((output / "metadata.json").read_text())["parameters"]
+    spacing, window = params["spacing"], params["cutoff"] + 1.25
+    sites = np.load(output / "lattice_sites.npy")
+    local_basis = np.load(output / "wannier_functions.npy")
+    basis, x, y = embed(local_basis, sites, spacing, window)
+    lowdin, _, _ = embed(np.load(output / "lowdin_basis_vec.npy"), sites, spacing, window)
+    A = np.load(output / "lowdin_transform.npy")
+    np.testing.assert_allclose(basis.T @ basis * spacing ** 2, np.load(output / "S_matrix.npy"), atol=1e-13)
+    np.testing.assert_allclose(lowdin.T @ lowdin * spacing ** 2, np.load(output / "S_lowdin.npy"), atol=1e-13)
+    full_lowdin = basis @ A
+    support, _, _ = embed(np.ones_like(local_basis), sites, spacing, window)
+    retained = np.sum(full_lowdin ** 2 * support, axis=0) * spacing ** 2
+    np.testing.assert_allclose(retained, np.load(output / "lowdin_retained_norms.npy"), atol=1e-13)
+    np.testing.assert_allclose(lowdin, full_lowdin * support / np.sqrt(retained), atol=1e-13)
+    np.testing.assert_allclose(full_lowdin.T @ full_lowdin * spacing ** 2, np.eye(len(sites)), atol=1e-12)
+    np.testing.assert_allclose(np.sum(lowdin ** 4, axis=0) * spacing ** 2, np.load(output / "hubbard_U.npy"), atol=1e-13)
+    pair_density = (lowdin ** 2).T @ (lowdin ** 2) * spacing ** 2
+    np.fill_diagonal(pair_density, 0)
+    np.testing.assert_allclose(pair_density, np.load(output / "U_iijj.npy"), atol=1e-13)
+    np.testing.assert_allclose(lowdin.T @ (lowdin ** 3) * spacing ** 2, np.load(output / "U_iiij.npy"), atol=1e-13)
+    X, Y = np.meshgrid(x, y)
+    H, _, _ = hamiltonian(x, y, potential(X, Y, params["depth"], np.array(params["k"]), np.array(params["phis"])))
+    common_H = basis.T @ (H @ basis) * spacing ** 2
+    actual_H = lowdin.T @ (H @ lowdin) * spacing ** 2
+    np.testing.assert_allclose(common_H, common_H.T, atol=1e-13)
+    metrics = dict(common_grid_H_max_difference=float(np.max(np.abs(common_H - load_npz(output / "hamiltonian_wannier.npz").toarray()))),
+                   cropped_H_max_difference=float(np.max(np.abs(actual_H - load_npz(output / "hamiltonian_real.npz").toarray()))),
+                   crop_onsite_max_difference=float(np.max(np.abs(np.sum(full_lowdin ** 4 - lowdin ** 4, axis=0) * spacing ** 2))))
+    print(json.dumps(metrics, indent=2))
+    return metrics
+
+
 def check_physical():
     from scipy.sparse import load_npz
     import quasi_hubbard as driver
@@ -136,6 +235,16 @@ def check_physical():
         driver.run(**CASE, output_dir=output)
         reference = arrays(output)
         assert reference["lattice_sites.npy"].shape == (6, 2)
+        # These are regression values for this coarse case, not converged predictions.
+        np.testing.assert_allclose(reference["hubbard_U.npy"],
+            [12.841331765205, 9.115502225828, 14.806413907975, 7.949288951335, 7.821457280734, 10.748228003191],
+            rtol=1e-7, atol=1e-9)
+        np.testing.assert_allclose(np.linalg.eigvalsh(reference["hamiltonian_real.npz"]),
+            [7.396249972872, 7.941659745782, 8.156846116361, 8.451433014269, 8.533540062060, 8.610748046460],
+            rtol=1e-7, atol=1e-9)
+        metrics = inspect_physical(output)
+        assert metrics["common_grid_H_max_difference"] < 1e-5
+        assert metrics["cropped_H_max_difference"] < 1e-5
         mtimes = {name: (output / name).stat().st_mtime_ns for name in reference}
         driver.run(**CASE, output_dir=output)
         assert mtimes == {name: (output / name).stat().st_mtime_ns for name in reference}
@@ -146,6 +255,18 @@ def check_physical():
         np.save(legacy / "S_matrix.npy", np.eye(6))
         with np.testing.assert_raises(ValueError):
             driver.run(**CASE, output_dir=legacy)
+        driver.run(**CASE, output_dir=legacy, fresh=True)
+        compare(reference, arrays(legacy))
+        metadata = json.loads((output / "metadata.json").read_text())
+        with patch.object(driver, "CALCULATION_VERSION", driver.CALCULATION_VERSION + 1), np.testing.assert_raises(ValueError):
+            driver.run(**CASE, output_dir=output)
+        assert json.loads((output / "metadata.json").read_text()) == metadata
+
+        # A failed atomic replacement leaves the previous complete checkpoint intact.
+        with patch.object(Path, "replace", side_effect=InterruptedError), np.testing.assert_raises(InterruptedError):
+            driver.save_atomic(output / "hubbard_U.npy", np.zeros(6))
+        np.testing.assert_array_equal(np.load(output / "hubbard_U.npy"), reference["hubbard_U.npy"])
+        assert not list(output.glob("*.tmp"))
 
         # The Hamiltonian checks its own file, even when the overlap still exists.
         (output / "hamiltonian_wannier.npz").unlink()
@@ -182,12 +303,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-original", metavar="NEW_DIRECTORY")
     parser.add_argument("--physical", action="store_true", help="also run the six-site calculation and restart checks")
+    parser.add_argument("--inspect", metavar="OUTPUT_DIRECTORY", help="independently check a small physical run on a common grid")
     args = parser.parse_args()
     if args.capture_original:
         capture_original(args.capture_original)
+    elif args.inspect:
+        inspect_physical(args.inspect)
     else:
         check_imports_and_grid()
         check_masks()
+        check_lowdin()
         if args.physical:
             check_physical()
         print("Checks passed.")

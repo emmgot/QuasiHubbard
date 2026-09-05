@@ -1,5 +1,6 @@
 """Construct Wannier functions and Hubbard matrix elements for the eightfold lattice."""
 import argparse
+import hashlib
 import importlib.metadata
 import json
 from pathlib import Path
@@ -14,12 +15,12 @@ from scipy.sparse import csc_matrix, hstack, issparse, load_npz, save_npz
 
 from cont_schrod import generate_grid
 from functions import (generate_wannier_function, compute_H, compute_S, compute_lowdin,
-                       compute_U_iijj, compute_U_iiij)
+                       compute_U_iijj, compute_U_iiij, symmetric_orthogonalization)
 from generate_lattice import generate_sites, generate_octagon, clean_rings
 from potential_functions import potential
 
 # Bump when numerical conventions or checkpoint contents change.
-CALCULATION_VERSION = 2
+CALCULATION_VERSION = 3
 # A missing stage invalidates every later stage, before any computation starts.
 # ponytail: one ordered sequence; some independent stages are recomputed after a gap.
 STAGES = (
@@ -27,8 +28,9 @@ STAGES = (
     ("wannier_functions.npy",),
     ("hamiltonian_wannier.npz",),
     ("S_matrix.npy",),
-    ("lowdin_transform.npy", "hamiltonian_real.npz"),
-    ("lowdin_basis_vec.npy",),
+    ("lowdin_transform.npy", "overlap_eigenvalues.npy", "hamiltonian_real.npz"),
+    ("lowdin_basis_vec.npy", "lowdin_retained_norms.npy"),
+    ("S_lowdin.npy",),
     ("hubbard_U.npy",),
     ("U_iijj.npy",),
     ("U_iiij.npy",),
@@ -93,8 +95,13 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
     """
     values = dict(depth=depth, diameter=diameter, spacing=spacing, cutoff=cutoff)
     for name, value in values.items():
-        if not np.isscalar(value) or not np.isfinite(value) or value <= 0:
+        try:
+            values[name] = float(value)
+        except (ValueError, TypeError):
+            raise ValueError(f"{name} must be a real number.") from None
+        if not np.isfinite(values[name]) or values[name] <= 0:
             raise ValueError(f"{name} must be finite and positive.")
+    depth, diameter, spacing, cutoff = (values[name] for name in ("depth", "diameter", "spacing", "cutoff"))
     if not isinstance(workers, int) or workers == 0 or workers < -1:
         raise ValueError("workers must be a positive integer, or -1 for all CPUs.")
     x_window, y_window = generate_grid((0, 0), cutoff + 1.25, spacing)
@@ -118,7 +125,10 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
     except (OSError, subprocess.CalledProcessError):
         revision = None
     metadata = dict(calculation_version=CALCULATION_VERSION, parameters=parameters,
-                    source_commit=revision, python=platform.python_version(), versions=versions)
+                    source_commit=revision, python=platform.python_version(), versions=versions,
+                    source_sha256={name: hashlib.sha256((Path(__file__).resolve().parent / name).read_bytes()).hexdigest()
+                                   for name in ("quasi_hubbard.py", "functions.py", "generate_lattice.py",
+                                                "potential_functions.py", "cont_schrod.py", "spread_minimisation.py")})
     output = Path(output_dir) if output_dir is not None else Path(f"size_{diameter:.2f}/fine/results_depth_{depth:.4f}")
     output.mkdir(parents=True, exist_ok=True)
     metadata_path = output / "metadata.json"
@@ -126,8 +136,9 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
         saved = json.loads(metadata_path.read_text())
         if (saved.get("calculation_version") != CALCULATION_VERSION
                 or saved.get("parameters") != parameters
+                or saved.get("source_sha256") != metadata["source_sha256"]
                 or saved.get("versions") != versions):
-            raise ValueError("Incompatible checkpoint parameters, calculation version or dependencies; "
+            raise ValueError("Incompatible checkpoint parameters, source code, calculation version or dependencies; "
                              "choose a new output directory or explicitly use fresh=True / --fresh.")
     elif not fresh and any(output.iterdir()):
         raise ValueError("Existing directory has no metadata; choose a new directory or use --fresh.")
@@ -201,21 +212,37 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
     cached = (output / "lowdin_transform.npy").exists()
     if cached:
         transform = np.load(output / "lowdin_transform.npy", allow_pickle=False)
+        eigenvalues = np.load(output / "overlap_eigenvalues.npy", allow_pickle=False)
     else:
-        eigenvalues, vectors = np.linalg.eigh(S)
-        transform = (vectors * (1 / np.sqrt(eigenvalues))) @ vectors.T
+        transform, eigenvalues = symmetric_orthogonalization(S)
         save_atomic(output / "lowdin_transform.npy", transform)
+        save_atomic(output / "overlap_eigenvalues.npy", eigenvalues)
         save_atomic(output / "hamiltonian_real.npz", csc_matrix(transform @ (H @ transform.T)))
     finished("lowdin_transform", cached)
 
     cached = (output / "lowdin_basis_vec.npy").exists()
     if cached:
         lowdin = np.load(output / "lowdin_basis_vec.npy", allow_pickle=False)
+        retained_norms = np.load(output / "lowdin_retained_norms.npy", allow_pickle=False)
     else:
-        lowdin = np.hstack(Parallel(n_jobs=workers)(
-            delayed(compute_lowdin)(i, basis, sites, transform, cutoff + 1.25, spacing) for i in range(n_sites)))
+        results = Parallel(n_jobs=workers)(
+            delayed(compute_lowdin)(i, basis, sites, transform, cutoff + 1.25, spacing, return_norm=True)
+            for i in range(n_sites))
+        lowdin = np.hstack([state for state, _ in results])
+        retained_norms = np.array([norm for _, norm in results])
         save_atomic(output / "lowdin_basis_vec.npy", lowdin)
+        save_atomic(output / "lowdin_retained_norms.npy", retained_norms)
     finished("lowdin_basis", cached)
+
+    cached = (output / "S_lowdin.npy").exists()
+    if cached:
+        final_overlap = np.load(output / "S_lowdin.npy", allow_pickle=False)
+    else:
+        half = hstack(Parallel(n_jobs=workers)(
+            delayed(compute_S)(i, lowdin, sites, cutoff, cutoff + 1.25, spacing) for i in range(n_sites)), format="csc")
+        final_overlap = (half + half.T).toarray()
+        save_atomic(output / "S_lowdin.npy", final_overlap)
+    finished("lowdin_overlap", cached)
 
     cached = (output / "hubbard_U.npy").exists()
     if not cached:
@@ -230,8 +257,16 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
                 result = result + result.T
             save_atomic(output / f"{name}.npy", result.toarray())
         finished(name, cached)
-    save_atomic(output / "summary.json", dict(sites=n_sites, local_grid=list((len(x_window), len(y_window))),
-                stage_seconds=times, total_seconds=time.perf_counter() - started, reused_stages=reused, workers=workers))
+    diagnostics = dict(overlap_eigenvalue_min=float(eigenvalues[0]),
+                       overlap_condition=float(eigenvalues[-1] / eigenvalues[0]),
+                       algebraic_overlap_max_error=float(np.max(np.abs(transform.T @ S @ transform - np.eye(n_sites)))),
+                       cropped_overlap_max_error=float(np.max(np.abs(final_overlap - np.eye(n_sites)))),
+                       max_crop_norm_loss=float(np.max(1 - retained_norms)))
+    save_atomic(output / "summary.json", dict(sites=n_sites, local_grid=[len(x_window), len(y_window)],
+                stage_seconds=times, total_seconds=time.perf_counter() - started, reused_stages=reused,
+                workers=workers, diagnostics=diagnostics))
+    print(f"Löwdin crop: max overlap error {diagnostics['cropped_overlap_max_error']:.3g}, "
+          f"max norm loss {diagnostics['max_crop_norm_loss']:.3g}", flush=True)
     if plot:
         plot_sites(output, params, candidates, sites)
     return output

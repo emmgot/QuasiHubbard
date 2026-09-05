@@ -80,8 +80,9 @@ def laplacian_DVR(nx: int, ny: int, dx: float, dy: float) -> lil_matrix:
     The positions are indexed as follows: (x_i, y_j) --> m = i + j * nx
     """
 
-    laplace = lil_matrix((nx * ny, nx * ny))  # Initialize an empty sparse matrix
-    n = nx * ny  # Total number of grid points
+    if not np.isfinite([dx, dy]).all() or dx <= 0 or not np.isclose(dx, dy, rtol=1e-9, atol=0):
+        raise ValueError("The current DVR operator requires equal positive x/y spacing.")
+    laplace = lil_matrix((nx * ny, nx * ny))
 
     for i_y in range(ny):
         for i_x in range(nx):
@@ -122,12 +123,20 @@ def hamiltonian(x_array: np.ndarray, y_array: np.ndarray, V_mat: np.ndarray) -> 
     The positions are indexed as follows: (x_i, y_j) --> m = i + nx * j
     """
 
-    nx = len(x_array)
-    ny = len(y_array)
+    x_array, y_array, V_mat = np.asarray(x_array), np.asarray(y_array), np.asarray(V_mat)
+    if x_array.ndim != 1 or y_array.ndim != 1 or x_array.size < 2 or y_array.size < 2:
+        raise ValueError("Hamiltonian grid axes need at least two points.")
+    nx, ny = len(x_array), len(y_array)
+    if V_mat.shape != (ny, nx) or not np.isfinite(V_mat).all() or np.iscomplexobj(V_mat):
+        raise ValueError("Potential must be finite and real with shape (ny, nx).")
     dx = x_array[1] - x_array[0]
     dy = y_array[1] - y_array[0]
 
-    H = lil_matrix((nx * ny, nx * ny))  # Initialize the Hamiltonian matrix
+    if (not np.isfinite(x_array).all() or not np.isfinite(y_array).all()
+            or dx <= 0 or dy <= 0
+            or not np.allclose(np.diff(x_array), dx, rtol=1e-9, atol=0)
+            or not np.allclose(np.diff(y_array), dy, rtol=1e-9, atol=0)):
+        raise ValueError("Hamiltonian axes must have uniform positive spacing.")
     laplace = laplacian_DVR(nx, ny, dx, dy)  # Compute the Laplacian matrix using DVR
 
     V_diag = V_mat.flatten()
@@ -171,8 +180,14 @@ def generate_grid(site: Tuple[float, float], half_width: float, global_step: flo
     - Tuple[np.ndarray, np.ndarray]: The x and y arrays defining the grid points.
     """
 
+    if (np.shape(site) != (2,) or not np.isfinite(site).all()
+            or not np.isfinite(half_width) or not np.isfinite(global_step)
+            or half_width <= 0 or global_step <= 0):
+        raise ValueError("Grid center must be finite; half-width and spacing must be finite and positive.")
     closest_point = closest_grid_point(site, global_step)
     n_points = np.round(half_width / global_step)
+    if not np.isfinite(n_points) or n_points < 1 or n_points > np.sqrt(np.iinfo(np.intp).max / 8) / 2:
+        raise ValueError("Grid size is empty or exceeds the addressable float64 array size.")
     actual_boundary = n_points * global_step
 
     grid_left = np.arange(n_points) * global_step - actual_boundary + closest_point[0]
@@ -203,34 +218,28 @@ def shift_to_global_grid(local_matrix: np.ndarray, local_x: np.ndarray, local_y:
     - Tuple[np.ndarray, bool]: The shifted global matrix and a flag indicating if an error occurred.
     """
 
-    error_flag = False
-    global_matrix = np.zeros((len(global_x), len(global_y)))
-    global_step = np.diff(global_x)[0]
-
-    try:
-        # Calculate intersections
-        left_intersection = np.round(np.max([local_x[0], global_x[0]]), 5)
-        right_intersection = np.round(np.min([local_x[-1], global_x[-1]]), 5)
-        down_intersection = np.round(np.max([local_y[0], global_y[0]]), 5)
-        up_intersection = np.round(np.min([local_y[-1], global_y[-1]]), 5)
-
-        # Find the indices in the local and global grids that correspond to the intersections
-        left_local_index = np.argwhere(np.round(local_x, 5) == left_intersection)[0][0]
-        right_local_index = np.argwhere(np.round(local_x, 5) == right_intersection)[0][0]
-        down_local_index = np.argwhere(np.round(local_y, 5) == down_intersection)[0][0]
-        up_local_index = np.argwhere(np.round(local_y, 5) == up_intersection)[0][0]
-
-        left_global_index = np.argwhere(np.round(global_x, 5) == left_intersection)[0][0]
-        right_global_index = np.argwhere(np.round(global_x, 5) == right_intersection)[0][0]
-        down_global_index = np.argwhere(np.round(global_y, 5) == down_intersection)[0][0]
-        up_global_index = np.argwhere(np.round(global_y, 5) == up_intersection)[0][0]
-
-        # Update the global matrix with the local matrix data
-        global_matrix[down_global_index:up_global_index + 1, left_global_index:right_global_index + 1] = \
-            local_matrix[down_local_index:up_local_index + 1, left_local_index:right_local_index + 1]
-
-    except IndexError:
-        error_flag = True
-
-    return global_matrix, error_flag
-
+    local_matrix = np.asarray(local_matrix)
+    if local_matrix.shape != (len(local_y), len(local_x)):
+        raise ValueError("local_matrix must have shape (len(local_y), len(local_x)).")
+    global_matrix = np.zeros((len(global_y), len(global_x)), dtype=local_matrix.dtype)
+    source, destination = [], []
+    for local, target in ((local_y, global_y), (local_x, global_x)):
+        local, target = np.asarray(local), np.asarray(target)
+        if len(local) < 2 or len(target) < 2:
+            raise ValueError("Grid axes need at least two points.")
+        step = target[1] - target[0]
+        if (not np.isfinite(local).all() or not np.isfinite(target).all() or step <= 0
+                or not np.allclose(np.diff(local), step, rtol=1e-9, atol=0)
+                or not np.allclose(np.diff(target), step, rtol=1e-9, atol=0)):
+            raise ValueError("Local and target grids must have matching uniform positive spacing.")
+        offset = (local[0] - target[0]) / step
+        if not np.isclose(offset, np.rint(offset), rtol=0, atol=1e-7):
+            raise ValueError("Local and target grids are not aligned.")
+        offset = int(np.rint(offset))
+        start, end = max(0, offset), min(len(target), offset + len(local))
+        source.append(slice(start - offset, end - offset))
+        destination.append(slice(start, end))
+    if any(s.stop <= s.start for s in destination):
+        return global_matrix, True  # Disjoint supports, not malformed coordinates.
+    global_matrix[tuple(destination)] = local_matrix[tuple(source)]
+    return global_matrix, False

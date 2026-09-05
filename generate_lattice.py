@@ -51,8 +51,20 @@ def generate_sites(center: Tuple[float, float], lattice_params: Dict[str, float]
             res = scipy.optimize.minimize(fun_potential, pos, args=(depth, k, phis), method="Newton-CG",
                                           jac=fun_jacobian, hess=fun_hessian)
             hessian = fun_hessian(res.x, depth, k, phis)
-            hessian_eigval, eigvecs = np.linalg.eig(hessian)
+            hessian_eigval = np.linalg.eigvalsh(hessian)
             check_saddle = np.all(hessian_eigval > 0)
+            # Newton-CG can report precision loss at a stationary point. Check its
+            # actual force, including on nominally successful returns.
+            force_scale = depth * np.max(np.linalg.norm(k, axis=1))
+            residual = np.linalg.norm(fun_jacobian(res.x, depth, k, phis)) / force_scale
+            if check_saddle and residual > 1e-5:
+                res = scipy.optimize.minimize(fun_potential, res.x, args=(depth, k, phis), method="Newton-CG",
+                                              jac=fun_jacobian, hess=fun_hessian, options={"xtol": 1e-10})
+                check_saddle = np.all(np.linalg.eigvalsh(fun_hessian(res.x, depth, k, phis)) > 0)
+                residual = np.linalg.norm(fun_jacobian(res.x, depth, k, phis)) / force_scale
+            if check_saddle and (not np.isfinite(residual) or residual > 1e-5):
+                raise ValueError(f"Minimum search failed the stationarity check: {res.message}; "
+                                 f"scaled force={residual:.3g} at {res.x}.")
             distance = np.sqrt(np.square(res.x[0] - center[0]) + np.square(res.x[1] - center[1]))
             distance_x = np.abs(res.x[0] - center[0])
             distance_y = np.abs(res.x[1] - center[1])
@@ -82,6 +94,13 @@ def clean_lattice_sites(minima_list: np.ndarray) -> np.ndarray:
     Returns:
         np.ndarray: A cleaned-up list of coordinates for the lattice sites.
     """
+    minima_list = np.asarray(minima_list, dtype=float)
+    if minima_list.size == 0:
+        return np.empty((0, 2))
+    if minima_list.ndim != 2 or minima_list.shape[1] != 2 or not np.isfinite(minima_list).all():
+        raise ValueError("Minima must be finite (x, y) pairs.")
+    if len(minima_list) == 1:
+        return minima_list.copy()
     cut_off = 0.004  # Fine-tune this parameter
 
     # Compute the pairwise distances and perform hierarchical clustering
@@ -190,6 +209,8 @@ def generate_octagon(site_list: Union[np.ndarray, Tuple[float, float]],
     """
     phi1, phi2, phi3, phi4 = phis
     k0 = 2 * np.pi
+    if len(site_list) == 0:
+        return np.empty((0, 2))
     X, Y = zip(*site_list)
     X, Y = np.array(X), np.array(Y)
     theta1 = np.mod(k0 * X + phi1, np.pi) - np.pi / 2
