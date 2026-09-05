@@ -19,7 +19,7 @@ from generate_lattice import generate_sites, generate_octagon, clean_rings
 from potential_functions import potential
 
 # Bump when numerical conventions or checkpoint contents change.
-CALCULATION_VERSION = 1
+CALCULATION_VERSION = 2
 # A missing stage invalidates every later stage, before any computation starts.
 # ponytail: one ordered sequence; some independent stages are recomputed after a gap.
 STAGES = (

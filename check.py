@@ -89,6 +89,7 @@ def check_imports_and_grid():
 
 
 def check_masks():
+    import potential_functions as potentials
     from potential_functions import potential_mask_contour
 
     X, Y = np.meshgrid(np.linspace(-1, 1, 7), np.linspace(-1, 1, 7))
@@ -99,6 +100,21 @@ def check_masks():
     assert mask.any() and (~mask).any()
     np.testing.assert_array_equal(masked[mask], 20)
     np.testing.assert_array_equal(masked[~mask], original[~mask])
+
+    # The narrower ellipse axis follows the stiffer direction, for any orientation.
+    # A zero potential keeps the contour part from obscuring the ellipse test.
+    for angle in (0., 0.37, np.pi / 2):
+        stiff = np.array([np.cos(angle), np.sin(angle)])
+        soft = np.array([-np.sin(angle), np.cos(angle)])
+        hessian = 9 * np.outer(stiff, stiff) + np.outer(soft, soft)
+        points = 0.25 * np.array([stiff, soft, -stiff, -soft])
+        with patch.object(potentials, "hessian_mat", return_value=hessian):
+            _, mask = potentials.potential_mask_site(points[:, 0], points[:, 1], np.zeros(4),
+                                                     (0, 0), 5., np.zeros((4, 2)), np.zeros(4))
+        np.testing.assert_array_equal(mask, [True, False, True, False])
+    with np.testing.assert_raises(ValueError):
+        potentials.potential_mask_hull(X, Y, original, np.array([[0, 0], [1, 0], [2, 0]]),
+                                       1., 5., np.zeros((4, 2)), np.zeros(4))
 
 
 def check_physical():
