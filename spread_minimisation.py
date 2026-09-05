@@ -1,4 +1,4 @@
-from cont_schrod import *
+import numpy as np
 
 
 def min_spread(state_set: np.ndarray, x_mean: float, y_mean: float, x_array: np.ndarray, y_array: np.ndarray,

@@ -6,10 +6,10 @@ import numpy as np
 # from numpy.matrix import transpose
 import scipy.optimize
 from scipy.cluster.hierarchy import single, fcluster
-from scipy.ndimage.filters import minimum_filter
+from scipy.ndimage import minimum_filter
 from scipy.spatial.distance import pdist
 
-import functions
+from cont_schrod import generate_grid
 from potential_functions import potential, fun_potential, fun_jacobian, fun_hessian
 
 
@@ -33,7 +33,7 @@ def generate_sites(center: Tuple[float, float], lattice_params: Dict[str, float]
     depth = lattice_params['depth']
     k = lattice_params['k']
     phis = lattice_params['phis']
-    x_array, y_array = functions.generate_grid(center, lattice_params['length'] / 2 + lattice_params['cut_off'] + 0.5,
+    x_array, y_array = generate_grid(center, lattice_params['length'] / 2 + lattice_params['cut_off'] + 0.5,
                                                0.03 / 5)
     X, Y = np.meshgrid(x_array, y_array)
     V = potential(X, Y, depth, k, phis)

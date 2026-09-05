@@ -1,5 +1,4 @@
 # Handles the Finite-Difference and Sinc discrete variable discretisation of the Schrodinger equation.
-import time
 from math import pi
 from typing import Tuple
 
@@ -123,7 +122,6 @@ def hamiltonian(x_array: np.ndarray, y_array: np.ndarray, V_mat: np.ndarray) -> 
     The positions are indexed as follows: (x_i, y_j) --> m = i + nx * j
     """
 
-    tic = time.perf_counter()
     nx = len(x_array)
     ny = len(y_array)
     dx = x_array[1] - x_array[0]
@@ -136,6 +134,103 @@ def hamiltonian(x_array: np.ndarray, y_array: np.ndarray, V_mat: np.ndarray) -> 
     V = diags(V_diag, offsets=0, shape=(nx * ny, nx * ny), format="csc", dtype=None)  # Diagonal potential energy matrix
 
     H = -1 / (4 * pi ** 2) * laplace + V  # Combine to form the Hamiltonian
-    toc = time.perf_counter()
 
     return H.tocsc(), laplace.tocsc(), V.tocsc()
+
+
+def closest_grid_point(point: Tuple[float, float], global_step: float) -> Tuple[float, float]:
+    """
+    Finds the closest grid point to a given point based on the global step size.
+
+    Parameters:
+    - point (Tuple[float, float]): The x, y coordinates of the point to find the closest grid point for.
+    - global_step (float): The step size for the global grid.
+
+    Returns:
+    - Tuple[float, float]: The x, y coordinates of the closest grid point.
+    """
+    x, y = point
+    n_x = np.round(x / global_step)
+    n_y = np.round(y / global_step)
+    closest_x = n_x * global_step
+    closest_y = n_y * global_step
+    return (closest_x, closest_y)
+
+
+def generate_grid(site: Tuple[float, float], half_width: float, global_step: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generates a grid synced with the global grid. The grid is centered around a given site and has an
+    approximate half-width. The function returns x and y coordinates for the grid.
+
+    Parameters:
+    - site (Tuple[float, float]): The x, y coordinates of the center site.
+    - half_width (float): The half-width of the grid.
+    - global_step (float): The step size for the global grid.
+
+    Returns:
+    - Tuple[np.ndarray, np.ndarray]: The x and y arrays defining the grid points.
+    """
+
+    closest_point = closest_grid_point(site, global_step)
+    n_points = np.round(half_width / global_step)
+    actual_boundary = n_points * global_step
+
+    grid_left = np.arange(n_points) * global_step - actual_boundary + closest_point[0]
+    grid_right = np.arange(n_points) * global_step + closest_point[0]
+
+    grid_down = np.arange(n_points) * global_step - actual_boundary + closest_point[1]
+    grid_up = np.arange(n_points) * global_step + closest_point[1]
+
+    x_array = np.concatenate([grid_left, grid_right])
+    y_array = np.concatenate([grid_down, grid_up])
+
+    return x_array, y_array
+
+
+def shift_to_global_grid(local_matrix: np.ndarray, local_x: np.ndarray, local_y: np.ndarray,
+                         global_x: np.ndarray, global_y: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """
+    Shifts a local matrix onto the global grid.
+
+    Parameters:
+    - local_matrix (np.ndarray): The local matrix to be shifted.
+    - local_x (np.ndarray): The x-axis coordinates for the local grid.
+    - local_y (np.ndarray): The y-axis coordinates for the local grid.
+    - global_x (np.ndarray): The x-axis coordinates for the global grid.
+    - global_y (np.ndarray): The y-axis coordinates for the global grid.
+
+    Returns:
+    - Tuple[np.ndarray, bool]: The shifted global matrix and a flag indicating if an error occurred.
+    """
+
+    error_flag = False
+    global_matrix = np.zeros((len(global_x), len(global_y)))
+    global_step = np.diff(global_x)[0]
+
+    try:
+        # Calculate intersections
+        left_intersection = np.round(np.max([local_x[0], global_x[0]]), 5)
+        right_intersection = np.round(np.min([local_x[-1], global_x[-1]]), 5)
+        down_intersection = np.round(np.max([local_y[0], global_y[0]]), 5)
+        up_intersection = np.round(np.min([local_y[-1], global_y[-1]]), 5)
+
+        # Find the indices in the local and global grids that correspond to the intersections
+        left_local_index = np.argwhere(np.round(local_x, 5) == left_intersection)[0][0]
+        right_local_index = np.argwhere(np.round(local_x, 5) == right_intersection)[0][0]
+        down_local_index = np.argwhere(np.round(local_y, 5) == down_intersection)[0][0]
+        up_local_index = np.argwhere(np.round(local_y, 5) == up_intersection)[0][0]
+
+        left_global_index = np.argwhere(np.round(global_x, 5) == left_intersection)[0][0]
+        right_global_index = np.argwhere(np.round(global_x, 5) == right_intersection)[0][0]
+        down_global_index = np.argwhere(np.round(global_y, 5) == down_intersection)[0][0]
+        up_global_index = np.argwhere(np.round(global_y, 5) == up_intersection)[0][0]
+
+        # Update the global matrix with the local matrix data
+        global_matrix[down_global_index:up_global_index + 1, left_global_index:right_global_index + 1] = \
+            local_matrix[down_local_index:up_local_index + 1, left_local_index:right_local_index + 1]
+
+    except IndexError:
+        error_flag = True
+
+    return global_matrix, error_flag
+
