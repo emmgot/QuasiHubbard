@@ -88,6 +88,19 @@ def check_imports_and_grid():
     assert np.isclose(dot_states(state, (0.23, -0.18), state, (0.23, -0.18), 0.1, 0.5) * 0.1 ** 2, 1)
 
 
+def check_masks():
+    from potential_functions import potential_mask_contour
+
+    X, Y = np.meshgrid(np.linspace(-1, 1, 7), np.linspace(-1, 1, 7))
+    original = np.arange(49.).reshape(7, 7)
+    masked, mask = potential_mask_contour(X, Y, original, (0, 0), 2.5, 0.3, 0.4,
+                                          0.0, 5., np.zeros((4, 2)), np.zeros(4))
+    assert mask.dtype == bool
+    assert mask.any() and (~mask).any()
+    np.testing.assert_array_equal(masked[mask], 20)
+    np.testing.assert_array_equal(masked[~mask], original[~mask])
+
+
 def check_physical():
     from scipy.sparse import load_npz
     import quasi_hubbard as driver
@@ -158,6 +171,7 @@ if __name__ == "__main__":
         capture_original(args.capture_original)
     else:
         check_imports_and_grid()
+        check_masks()
         if args.physical:
             check_physical()
         print("Checks passed.")

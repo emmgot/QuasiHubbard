@@ -273,7 +273,7 @@ def potential_mask_contour(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarr
 
     V_mask = np.copy(V_mat)
     mask = np.logical_and(mask_contour, mask_ellipse)
-    mask = 1 - mask
+    mask = ~mask
     V_mask[mask] = len(k) * depth
 
     return V_mask, mask
