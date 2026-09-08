@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 
 ORIGINAL_COMMIT = "5885c1d8c23c59ec5d55eb2f850da50ade28bb1d"
-CASE = dict(depth=5.0, diameter=1.5, spacing=0.2, cutoff=1.0)
+CASE = dict(depth=5.0, diameter=1.5, spacing=0.2, cutoff=1.0, device="cpu")
 
 
 def capture_original(output):
@@ -177,6 +177,7 @@ def check_lowdin():
 
 
 def check_torch():
+    import torch
     from cont_schrod import hamiltonian, lowest_eigenstates, resolve_device
 
     x, y = np.arange(4) * 0.2, np.arange(3) * 0.2
@@ -192,10 +193,14 @@ def check_torch():
                 + np.diag(potential.reshape(-1)))
     actual = hamiltonian(x, y, potential, "cpu").to_dense().numpy()
     np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-14)
-    values, vectors = lowest_eigenstates(x, y, potential, 2, seed=7, device="cpu")
-    np.testing.assert_allclose(values, np.linalg.eigvalsh(expected)[:2], rtol=1e-10, atol=1e-10)
-    residual = np.linalg.norm(expected @ vectors - vectors * values, axis=0) / np.maximum(1, np.abs(values))
-    assert residual.max() < 1e-8
+    for device in (["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]):
+        values, vectors = lowest_eigenstates(x, y, potential, 2, seed=7, device=device)
+        np.testing.assert_allclose(values, np.linalg.eigvalsh(expected)[:2], rtol=1e-10, atol=1e-10)
+        residual = np.linalg.norm(expected @ vectors - vectors * values, axis=0) / np.maximum(1, np.abs(values))
+        assert residual.max() < 1e-8
+    for maxiter in (0, -1, 1.5, True):
+        with np.testing.assert_raises(ValueError):
+            lowest_eigenstates(x, y, potential, 2, seed=7, device="cpu", maxiter=maxiter)
     assert resolve_device("cpu") == "cpu"
     with np.testing.assert_raises(ValueError):
         resolve_device("mps")
@@ -277,6 +282,8 @@ def check_physical():
         assert mtimes == {name: (output / name).stat().st_mtime_ns for name in reference}
         with np.testing.assert_raises(ValueError):
             driver.run(**dict(CASE, depth=5.00000001), output_dir=output)
+        with np.testing.assert_raises(ValueError):
+            driver.run(**CASE, eigensolver_maxiter=3000, output_dir=output)
         legacy = Path(directory) / "legacy"
         legacy.mkdir()
         np.save(legacy / "S_matrix.npy", np.eye(6))
@@ -317,12 +324,26 @@ def check_physical():
         driver.run(**CASE, output_dir=output)
         compare(reference, arrays(output))
 
-        parallel = driver.run(**CASE, workers=2, output_dir=Path(directory) / "parallel")
+        # CPU regression must stay on CPU even on a CUDA host.
+        with patch("torch.cuda.is_available", return_value=True):
+            parallel = driver.run(**CASE, workers=2, output_dir=Path(directory) / "parallel")
         compare(reference, arrays(parallel))
         cli = Path(directory) / "cli"
         subprocess.run([sys.executable, "quasi_hubbard.py", "5", "1.5", "--spacing", "0.2",
-                        "--cutoff", "1", "--output-dir", str(cli)], check=True)
+                        "--cutoff", "1", "--device", "cpu", "--eigensolver-maxiter", "2000",
+                        "--output-dir", str(cli)], check=True)
         compare(reference, arrays(cli))
+        assert json.loads((cli / "metadata.json").read_text())["parameters"]["device"] == "cpu"
+
+        # This shallow lattice needs more than the old 500-iteration limit.
+        shallow = dict(CASE, depth=0.1, spacing=0.1)
+        short = Path(directory) / "shallow-short"
+        with np.testing.assert_raises_regex(ValueError, "Eigensolver residual too large"):
+            driver.run(**shallow, eigensolver_maxiter=500, output_dir=short)
+        assert not (short / "wannier_functions.npy").exists()
+        converged = driver.run(**shallow, output_dir=Path(directory) / "shallow")
+        assert np.isfinite(np.load(converged / "wannier_functions.npy")).all()
+        assert (converged / "summary.json").is_file()
     print("Six-site CPU, serial/parallel, CLI and interrupted-restart checks passed.")
 
 

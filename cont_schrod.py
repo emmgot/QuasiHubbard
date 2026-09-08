@@ -5,6 +5,8 @@ from typing import Tuple
 import numpy as np
 import torch
 
+DEFAULT_EIGENSOLVER_MAXITER = 2000
+
 
 def resolve_device(device="auto"):
     """Resolve and validate the float64 CPU or CUDA calculation device."""
@@ -64,21 +66,25 @@ def hamiltonian(x_array, y_array, potential, device="auto"):
                                    dtype=torch.float64, device=device).coalesce()
 
 
-def lowest_eigenstates(x_array, y_array, potential, count, seed, device="auto"):
+def lowest_eigenstates(x_array, y_array, potential, count, seed, device="auto", *,
+                       maxiter=DEFAULT_EIGENSOLVER_MAXITER):
     """Return the lowest eigenpairs using sparse float64 LOBPCG."""
+    if type(maxiter) is not int or maxiter < 1:
+        raise ValueError("maxiter must be a positive integer.")
     matrix = hamiltonian(x_array, y_array, potential, device)
     if not 1 <= count <= matrix.shape[0] // 3:
         raise ValueError("LOBPCG requires at least three grid points per eigenpair.")
     generator = torch.Generator(device=matrix.device).manual_seed(seed)
     initial = torch.randn((matrix.shape[0], count), generator=generator,
                           dtype=torch.float64, device=matrix.device)
-    values, vectors = torch.lobpcg(matrix, k=count, X=initial, niter=500,
+    values, vectors = torch.lobpcg(matrix, k=count, X=initial, niter=maxiter,
                                    tol=1e-10, largest=False, method="ortho")
     residual = torch.linalg.vector_norm(
         torch.sparse.mm(matrix, vectors) - vectors * values, dim=0
     ) / torch.maximum(torch.ones_like(values), values.abs())
     if not torch.isfinite(residual).all() or residual.max().item() > 1e-8:
-        raise ValueError(f"Eigensolver residual too large: {residual.max().item():.3g}.")
+        raise ValueError(f"Eigensolver residual too large: {residual.max().item():.3g}. "
+                         f"Increase eigensolver_maxiter / --eigensolver-maxiter (currently {maxiter}).")
     return values.cpu().numpy(), vectors.cpu().numpy()
 
 

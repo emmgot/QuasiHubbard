@@ -28,6 +28,8 @@ This is a coarse regression case, not a converged physical prediction. The defau
 
 Apple MPS is not used because this calculation preserves float64 numerical precision, which the tested MPS backend does not support. The MacBook therefore runs the PyTorch code on CPU; the same code selects CUDA on the future H100.
 
+The eigensolver allows up to 2,000 iterations per site and stops early on convergence. For harder cases, increase `--eigensolver-maxiter` (or `eigensolver_maxiter` in Python). The limit is recorded in checkpoint metadata; changing it requires a new output directory or `--fresh`. The eigenpair residual check still rejects unconverged results.
+
 Use `--plot` to save `lattice_sites_V.png`. Plotting is skipped by default. The same calculation is callable from Python:
 
 ```python
@@ -83,7 +85,8 @@ The Löwdin transform rejects nonpositive or numerically singular overlaps inste
 MPLBACKEND=Agg python check.py
 
 # Six-site physical regression, common-grid matrix checks, serial/parallel,
-# Python/CLI equivalence and interrupted checkpoints. Usually several seconds.
+# Python/CLI equivalence, interrupted checkpoints and a shallow-lattice solve.
+# CPU execution; usually tens of seconds.
 MPLBACKEND=Agg OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python check.py --physical
 
 # Independently inspect a small saved calculation on the union of local grids.

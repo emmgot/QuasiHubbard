@@ -140,7 +140,7 @@ def generate_wannier_function(index_site: int, lattice_params: Dict[str, Union[n
     V_mask, _ = potential_mask_hull(Xmesh, Ymesh, V_window, neighbour_minima, cut_off,
                                     depth, k, phis, rings_list=neighbour_rings)
     val, vec = lowest_eigenstates(x_window, y_window, V_mask, n_states, index_site,
-                                  lattice_params['device'])
+                                  lattice_params['device'], maxiter=lattice_params['eigensolver_maxiter'])
     norm = np.sum(np.abs(vec) ** 2, axis=0) * dx * dy
     normalized_states = vec / np.sqrt(norm)
 
