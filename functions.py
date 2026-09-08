@@ -6,12 +6,12 @@ from typing import Dict, List, Tuple, Union
 
 import matplotlib.colors as colors
 import matplotlib.pyplot as plt
-import scipy.sparse.linalg
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy import integrate
 from scipy.sparse import csc_matrix
 
-from cont_schrod import hamiltonian, closest_grid_point, generate_grid, shift_to_global_grid
+from cont_schrod import (apply_hamiltonian, closest_grid_point, generate_grid,
+                         lowest_eigenstates, shift_to_global_grid)
 from generate_lattice import generate_sites, generate_octagon, clean_rings
 from potential_functions import potential, potential_mask_hull
 from spread_minimisation import min_spread
@@ -139,13 +139,8 @@ def generate_wannier_function(index_site: int, lattice_params: Dict[str, Union[n
     V_window = potential(Xmesh, Ymesh, depth, k, phis)
     V_mask, _ = potential_mask_hull(Xmesh, Ymesh, V_window, neighbour_minima, cut_off,
                                     depth, k, phis, rings_list=neighbour_rings)
-    H_local, _, _ = hamiltonian(x_window, y_window, V_mask)
-    # Site-specific starting vectors make serial, parallel and resumed solves comparable.
-    v0 = np.random.default_rng(index_site).standard_normal(H_local.shape[0])
-    val, vec = scipy.sparse.linalg.eigsh(H_local, k=n_states, which='SA', v0=v0)
-    residual = np.linalg.norm(H_local @ vec - vec * val, axis=0) / np.maximum(1, np.abs(val))
-    if not np.isfinite(residual).all() or residual.max() > 1e-8:
-        raise ValueError(f"Eigensolver residual too large at site {index_site}: {residual.max():.3g}.")
+    val, vec = lowest_eigenstates(x_window, y_window, V_mask, n_states, index_site,
+                                  lattice_params['device'])
     norm = np.sum(np.abs(vec) ** 2, axis=0) * dx * dy
     normalized_states = vec / np.sqrt(norm)
 
@@ -261,9 +256,8 @@ def compute_H(i_site: int, wannier_functions_vec: np.ndarray, minima_clean: np.n
     x_window_i, y_window_i = generate_grid(site_i, window_radius, global_step)
     X_window_i, Y_window_i = np.meshgrid(x_window_i, y_window_i)
     V_window_i = potential(X_window_i, Y_window_i, depth, k, phis)
-    H_window_i, _, _ = hamiltonian(x_window_i, y_window_i, V_window_i)
-
-    H_wannier_i = H_window_i.dot(wannier_i)
+    H_wannier_i = apply_hamiltonian(x_window_i, y_window_i, V_window_i, wannier_i,
+                                    lattice_params['device'])
 
     for j_site in range(i_site + 1):
         site_j = minima_clean[j_site]

@@ -1,6 +1,6 @@
-# CPU cleanup verification — 2026-09-05
+# CPU and PyTorch verification — 2026-09-08
 
-Reference environment: Python 3.9.6, NumPy 2.0.2, SciPy 1.13.1, Matplotlib 3.9.4 and Joblib 1.5.3 on macOS arm64. BLAS/OpenMP thread counts were set to one. The original source revision is `5885c1d8c23c59ec5d55eb2f850da50ade28bb1d`.
+Reference environment: Python 3.9.6, PyTorch 2.8.0, NumPy 2.0.2, SciPy 1.13.1, Matplotlib 3.9.4 and Joblib 1.5.3 on macOS arm64. The original source revision is `5885c1d8c23c59ec5d55eb2f850da50ade28bb1d`.
 
 ## Historical reference and structural changes
 
@@ -54,8 +54,10 @@ python check.py --inspect .reference/c2
 
 `python check.py --physical` verifies the corrected six-site observables, direct common-grid overlaps/interactions, serial vs two-worker execution, Python vs CLI execution, unchanged checkpoint modification times on complete resume, exact-parameter and calculation-version rejection, explicit fresh handling of legacy directories, a missing Hamiltonian despite an existing S, and interruption after newly saved wavefunctions. A failed atomic replacement preserves the previous complete array. The plot path was also executed and visually checked.
 
-## What remains for GPU work
+## PyTorch solver replacement
 
-In the coarse serial case, Wannier construction took approximately 0.4 s and Hamiltonian assembly 0.26 s; other numerical stages were individually below 0.01 s. At spacing 0.05 and cutoff 1, those two stages took approximately 19.6 s and 17.6 s. Some sensitivity runs ran concurrently, so these are indicative stage timings, not controlled acceleration benchmarks.
+The SciPy DVR assembly and `eigsh` path was replaced directly by a float64 PyTorch sparse COO Hamiltonian and `torch.lobpcg`; there is no backend abstraction or duplicate implementation. An independently constructed 12 by 12 DVR matrix verifies signs, flattening, potential placement and boundary couplings. Its two lowest eigenvalues and scaled residuals are checked directly.
 
-Repeated sparse DVR construction remains in both stages; local minima searches still use a fine-grid extent depending on the full diameter. The default local grid is 104 × 104, with 2,238,912 DVR nonzero entries. A hypothetical dense float64 matrix would occupy 0.936 GB, but that is not the current sparse storage cost. Peak memory and production-scale profiles have not yet been measured. No PyTorch/GPU implementation, finite-difference repair, ring redesign, complex solver extension or legacy checkpoint migration was introduced.
+On the six-site case with a 44 × 44 local grid, PyTorch CPU took approximately 1.97 s for Wannier construction and 0.05 s for Hamiltonian matrix elements. The prior SciPy profile took approximately 3.12 s and 2.92 s for those stages. The largest wavefunction difference was 1.97e-9, the largest real-Hamiltonian element difference was 7.03e-11, and its largest eigenvalue difference was 1.43e-11. The runnable coarse 22 × 22 regression retains the established onsite-integral and Hamiltonian-spectrum tolerances and passes serial, parallel, CLI, resume and interrupted-write checks.
+
+The current MacBook runs this path on CPU. Apple MPS is excluded because the calculation uses float64. `--device auto` will select CUDA when the future NVIDIA H100 is available; CUDA execution is restricted to one worker to avoid duplicating GPU state. Actual CUDA correctness, memory use and end-to-end speed still need measurement on that hardware. Local minima searches still use a fine-grid extent depending on the full diameter, and repeated Hamiltonian construction remains a possible optimization target.
