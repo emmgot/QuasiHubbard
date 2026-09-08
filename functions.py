@@ -1,20 +1,19 @@
 # This file contains miscellaneous functions about the generation of the TB-FDS Hamiltonian
 # Imports
 
-import time
-from typing import Dict
+import numpy as np
+from typing import Dict, List, Tuple, Union
 
 import matplotlib.colors as colors
 import matplotlib.pyplot as plt
-import scipy.optimize
 import scipy.sparse.linalg
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy import integrate
 from scipy.sparse import csc_matrix
 
-from cont_schrod import hamiltonian
-from generate_lattice import *
-from potential_functions import *
+from cont_schrod import hamiltonian, closest_grid_point, generate_grid, shift_to_global_grid
+from generate_lattice import generate_sites, generate_octagon, clean_rings
+from potential_functions import potential, potential_mask_hull
 from spread_minimisation import min_spread
 
 
@@ -111,8 +110,9 @@ def generate_wannier_function(index_site: int, lattice_params: Dict[str, Union[n
     minima = lattice_params['lattice_sites']
     rings_list = lattice_params['rings_list']
     cut_off = lattice_params['cut_off']
-    if minima.shape[0] > 0:
-        site = minima[index_site, :]
+    if not 0 <= index_site < len(minima):
+        raise ValueError("Wannier site index is outside the retained site list.")
+    site = minima[index_site, :]
 
     depth = lattice_params['depth']
     global_step = lattice_params['global_step']
@@ -126,7 +126,10 @@ def generate_wannier_function(index_site: int, lattice_params: Dict[str, Union[n
     neighbour_octagon = generate_octagon(neighbour_minima, phis)
     neighbour_minima, neighbour_rings = clean_rings(neighbour_minima, neighbour_octagon)
     neighbour_rings = count_neighbour_rings(site, cut_off, rings_list)
-    n_states_neighbour = len(neighbour_minima)
+    n_states = len(neighbour_minima)
+    if not 1 <= state_number <= n_states < len(x_window) * len(y_window):
+        raise ValueError(f"Need 1 <= state_number <= neighboring states ({n_states}) < grid dimension; "
+                         "increase cutoff or refine spacing.")
     Xmesh, Ymesh = np.meshgrid(x_window, y_window)
     n_x_local = len(x_window)
     n_y_local = len(y_window)
@@ -134,31 +137,22 @@ def generate_wannier_function(index_site: int, lattice_params: Dict[str, Union[n
     dx = np.diff(x_window)[0]
     dy = np.diff(y_window)[0]
     V_window = potential(Xmesh, Ymesh, depth, k, phis)
-    n_neighbour_rings = neighbour_rings.shape[0]
-    in_ring = (len(count_neighbour_rings(site, 0.5, rings_list)) != 0)
-
-    if n_neighbour_rings != 0:
-        V_mask, mask = potential_mask_hull(Xmesh, Ymesh, V_window, neighbour_minima, cut_off, depth, k, phis
-                                           , rings_list=neighbour_rings)
-    else:
-        V_mask, mask = potential_mask_hull(Xmesh, Ymesh, V_window, neighbour_minima, cut_off, depth, k, phis)
-
-    H_local, L_local, V_mat = hamiltonian(x_window, y_window, V_mask)
-    n_states = n_states_neighbour
-    val, vec = scipy.sparse.linalg.eigsh(H_local, k=n_states, which='SA', v0=None)
-    zFDS = np.argsort(val)
-    vec = vec[:, zFDS]
-    vec_clean = vec
-    norm = np.sum(np.square(np.abs(vec_clean)), axis=0) * dx * dy
-    state = vec_clean / np.sqrt(norm.reshape((1, len(norm))))
-    normalized_states = state
-    toc = time.perf_counter()
+    V_mask, _ = potential_mask_hull(Xmesh, Ymesh, V_window, neighbour_minima, cut_off,
+                                    depth, k, phis, rings_list=neighbour_rings)
+    H_local, _, _ = hamiltonian(x_window, y_window, V_mask)
+    # Site-specific starting vectors make serial, parallel and resumed solves comparable.
+    v0 = np.random.default_rng(index_site).standard_normal(H_local.shape[0])
+    val, vec = scipy.sparse.linalg.eigsh(H_local, k=n_states, which='SA', v0=v0)
+    residual = np.linalg.norm(H_local @ vec - vec * val, axis=0) / np.maximum(1, np.abs(val))
+    if not np.isfinite(residual).all() or residual.max() > 1e-8:
+        raise ValueError(f"Eigensolver residual too large at site {index_site}: {residual.max():.3g}.")
+    norm = np.sum(np.abs(vec) ** 2, axis=0) * dx * dy
+    normalized_states = vec / np.sqrt(norm)
 
     result_vec = np.zeros((n_x_local * n_y_local, state_number))
     for i_state in range(state_number):
         complex_coefs = np.squeeze(min_spread(normalized_states, x_mean, y_mean, x_window, y_window, i_state=i_state))
 
-        tic = time.perf_counter()
         wannier_function = complex_coefs * normalized_states
         wannier_function = np.sum(wannier_function, axis=1)
         global_phase = np.sign(wannier_function[np.argmax(
@@ -197,107 +191,6 @@ def generate_wannier_function(index_site: int, lattice_params: Dict[str, Union[n
     return result_vec
 
 
-def closest_grid_point(point: Tuple[float, float], global_step: float) -> Tuple[float, float]:
-    """
-    Finds the closest grid point to a given point based on the global step size.
-
-    Parameters:
-    - point (Tuple[float, float]): The x, y coordinates of the point to find the closest grid point for.
-    - global_step (float): The step size for the global grid.
-
-    Returns:
-    - Tuple[float, float]: The x, y coordinates of the closest grid point.
-    """
-    x, y = point
-    n_x = np.round(x / global_step)
-    n_y = np.round(y / global_step)
-    closest_x = n_x * global_step
-    closest_y = n_y * global_step
-    return (closest_x, closest_y)
-
-
-def generate_grid(site: Tuple[float, float], half_width: float, global_step: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Generates a grid synced with the global grid. The grid is centered around a given site and has an
-    approximate half-width. The function returns x and y coordinates for the grid.
-
-    Parameters:
-    - site (Tuple[float, float]): The x, y coordinates of the center site.
-    - half_width (float): The half-width of the grid.
-    - global_step (float): The step size for the global grid.
-
-    Returns:
-    - Tuple[np.ndarray, np.ndarray]: The x and y arrays defining the grid points.
-    """
-
-    closest_point = closest_grid_point(site, global_step)
-    n_points = np.round(half_width / global_step)
-    actual_boundary = n_points * global_step
-
-    grid_left = np.arange(n_points) * global_step - actual_boundary + closest_point[0]
-    grid_right = np.arange(n_points) * global_step + closest_point[0]
-
-    grid_down = np.arange(n_points) * global_step - actual_boundary + closest_point[1]
-    grid_up = np.arange(n_points) * global_step + closest_point[1]
-
-    x_array = np.concatenate([grid_left, grid_right])
-    y_array = np.concatenate([grid_down, grid_up])
-
-    return x_array, y_array
-
-
-def shift_to_global_grid(local_matrix: np.ndarray, local_x: np.ndarray, local_y: np.ndarray,
-                         global_x: np.ndarray, global_y: np.ndarray) -> Tuple[np.ndarray, bool]:
-    """
-    Shifts a local matrix onto the global grid.
-
-    Parameters:
-    - local_matrix (np.ndarray): The local matrix to be shifted.
-    - local_x (np.ndarray): The x-axis coordinates for the local grid.
-    - local_y (np.ndarray): The y-axis coordinates for the local grid.
-    - global_x (np.ndarray): The x-axis coordinates for the global grid.
-    - global_y (np.ndarray): The y-axis coordinates for the global grid.
-
-    Returns:
-    - Tuple[np.ndarray, bool]: The shifted global matrix and a flag indicating if an error occurred.
-    """
-
-    error_flag = False
-    global_matrix = np.zeros((len(global_x), len(global_y)))
-    global_step = np.diff(global_x)[0]
-
-    try:
-        # Calculate intersections
-        left_intersection = np.round(np.max([local_x[0], global_x[0]]), 5)
-        right_intersection = np.round(np.min([local_x[-1], global_x[-1]]), 5)
-        down_intersection = np.round(np.max([local_y[0], global_y[0]]), 5)
-        up_intersection = np.round(np.min([local_y[-1], global_y[-1]]), 5)
-
-        # Find the indices in the local and global grids that correspond to the intersections
-        left_local_index = np.argwhere(np.round(local_x, 5) == left_intersection)[0][0]
-        right_local_index = np.argwhere(np.round(local_x, 5) == right_intersection)[0][0]
-        down_local_index = np.argwhere(np.round(local_y, 5) == down_intersection)[0][0]
-        up_local_index = np.argwhere(np.round(local_y, 5) == up_intersection)[0][0]
-
-        left_global_index = np.argwhere(np.round(global_x, 5) == left_intersection)[0][0]
-        right_global_index = np.argwhere(np.round(global_x, 5) == right_intersection)[0][0]
-        down_global_index = np.argwhere(np.round(global_y, 5) == down_intersection)[0][0]
-        up_global_index = np.argwhere(np.round(global_y, 5) == up_intersection)[0][0]
-
-        # Update the global matrix with the local matrix data
-        global_matrix[down_global_index:up_global_index + 1, left_global_index:right_global_index + 1] = \
-            local_matrix[down_local_index:up_local_index + 1, left_local_index:right_local_index + 1]
-
-    except IndexError:
-        error_flag = True
-
-    return global_matrix, error_flag
-
-
-from typing import Union
-import numpy as np
-
-
 def dot_states(state_1: np.ndarray, site_1: Union[np.ndarray, Tuple[float, float]],
                state_2: np.ndarray, site_2: Union[np.ndarray, Tuple[float, float]],
                global_step: float, window_radius: float) -> Union[float, complex]:
@@ -324,7 +217,7 @@ def dot_states(state_1: np.ndarray, site_1: Union[np.ndarray, Tuple[float, float
     n_x_window_2, n_y_window_2 = len(x_window_2), len(y_window_2)
 
     # Shift state_2 to the grid of state_1
-    state_2_shift, error_flag = shift_to_global_grid(state_2.reshape((n_x_window_2, n_y_window_2)),
+    state_2_shift, error_flag = shift_to_global_grid(state_2.reshape((n_y_window_2, n_x_window_2)),
                                                      x_window_2, y_window_2,
                                                      x_window_1, y_window_1)
 
@@ -427,8 +320,25 @@ def compute_S(i_site: int, wannier_functions_vec: np.ndarray, minima_clean: np.n
     return csc_matrix(S_matrix)
 
 
+def symmetric_orthogonalization(overlap):
+    """Return S^(-1/2) and its spectrum, rejecting a numerically dependent basis."""
+    overlap = np.asarray(overlap)
+    if (overlap.ndim != 2 or overlap.shape[0] != overlap.shape[1] or not overlap.size
+            or not np.isfinite(overlap).all() or np.iscomplexobj(overlap)
+            or not np.allclose(overlap, overlap.T, rtol=1e-12, atol=1e-12)):
+        raise ValueError("Overlap must be a finite real symmetric square matrix.")
+    values, vectors = np.linalg.eigh(overlap)
+    if values[0] <= len(values) * np.finfo(float).eps * max(1., values[-1]):
+        raise ValueError(f"Overlap is nonpositive or numerically singular: smallest eigenvalue {values[0]:.3g}.")
+    transform = (vectors * (1 / np.sqrt(values))) @ vectors.T
+    if np.max(np.abs(transform.T @ overlap @ transform - np.eye(len(values)))) > 1e-8:
+        raise ValueError("Löwdin transformation lost orthogonality; the overlap is poorly conditioned.")
+    return transform, values
+
+
 def compute_lowdin(i_site: int, wannier_functions_vec: np.ndarray, minima_clean: np.ndarray,
-                   symm_orthog: np.ndarray, window_radius: float, global_step: float, plot: bool = False) -> np.ndarray:
+                   symm_orthog: np.ndarray, window_radius: float, global_step: float, plot: bool = False,
+                   return_norm: bool = False):
     """
     Compute Löwdin orthonormalized wave function for a given lattice site.
 
@@ -440,6 +350,7 @@ def compute_lowdin(i_site: int, wannier_functions_vec: np.ndarray, minima_clean:
     - window_radius (float): The radius of the local grid window around each site.
     - global_step (float): The global step size for the grid.
     - plot (bool): Whether to plot the result or not.
+    - return_norm (bool): Also return the squared norm retained before renormalizing the crop.
 
     Returns:
     - np.ndarray: The Löwdin orthonormalized wave function at the site.
@@ -455,12 +366,14 @@ def compute_lowdin(i_site: int, wannier_functions_vec: np.ndarray, minima_clean:
         state_j = wannier_functions_vec[:, j_site]
         x_window_j, y_window_j = generate_grid(site_j, window_radius, global_step)
         n_x_window_j, n_y_window_j = len(x_window_j), len(y_window_j)
-        state_j_shift, error_flag = shift_to_global_grid(state_j.reshape((n_x_window_j, n_y_window_j)), x_window_j,
+        state_j_shift, error_flag = shift_to_global_grid(state_j.reshape((n_y_window_j, n_x_window_j)), x_window_j,
                                                          y_window_j,
                                                          x_window_i, y_window_i)
         if error_flag == False:
             res[:, 0] += symm_orthog[i_site, j_site] * state_j_shift.ravel()
-    norm = np.sum(np.square(np.abs(res)), axis=0) * global_step ** 2
+    norm = float(np.sum(np.abs(res) ** 2) * global_step ** 2)
+    if not np.isfinite(norm) or norm <= 0:
+        raise ValueError(f"Löwdin crop has zero or invalid norm at site {i_site}.")
 
     if plot:
         plt.figure(2)
@@ -469,7 +382,7 @@ def compute_lowdin(i_site: int, wannier_functions_vec: np.ndarray, minima_clean:
         fig, ax = plt.subplots(1, 1, figsize=(7 * cm, 4 * cm))
         ax.axis('equal')
         pcm = ax.pcolormesh(x_window_i, y_window_i, vec_plot, cmap='RdBu_r',
-                            norm=colors.DivergingNorm(vmin=-np.max(vec_plot),
+                            norm=colors.TwoSlopeNorm(vmin=-np.max(vec_plot),
                                                       vcenter=0., vmax=np.max(vec_plot)))
 
         ax.axis(xmin=site_i[0] - 2.3, xmax=site_i[0] + 2.3, ymin=site_i[1] - 2.3,
@@ -481,7 +394,8 @@ def compute_lowdin(i_site: int, wannier_functions_vec: np.ndarray, minima_clean:
         cbar.set_ticks([])
         plt.savefig("lowdin_site_" + str(i_site) + ".png", dpi=900)
         plt.clf()
-    return res / np.sqrt(norm)
+    result = res / np.sqrt(norm)
+    return (result, norm) if return_norm else result
 
 
 def count_neighbour_rings(site: Union[List[float], np.ndarray],
@@ -592,7 +506,6 @@ def compute_U_iiij(i_site: int,
     n_states = minima_clean.shape[0]
     wannier_i = wannier_functions_vec[:, i_site]
     U_iiij = np.zeros((n_states, 1))
-    x_window_i, y_window_i = generate_grid(site_i, window_radius, global_step)
     for j_site in range(n_states):
         site_j = minima_clean[j_site]
         distance = np.linalg.norm(np.subtract(site_i, site_j))

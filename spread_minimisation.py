@@ -1,4 +1,4 @@
-from cont_schrod import *
+import numpy as np
 
 
 def min_spread(state_set: np.ndarray, x_mean: float, y_mean: float, x_array: np.ndarray, y_array: np.ndarray,
@@ -18,9 +18,7 @@ def min_spread(state_set: np.ndarray, x_mean: float, y_mean: float, x_array: np.
         np.ndarray: The vector representing the minimal spread of states for the given state index.
     """
     R_matrix = compute_R_matrix(state_set, x_mean, y_mean, x_array, y_array)
-    val, vec = np.linalg.eigh(R_matrix)
-    val = val[np.argsort(val)]
-    vec = vec[:, np.argsort(val)]
+    _, vec = np.linalg.eigh(R_matrix)
     min_vec = vec[:, i_state]
     norm = np.sum(np.square(np.abs(min_vec)))
     min_vec = min_vec / np.sqrt(norm)

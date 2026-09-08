@@ -4,6 +4,7 @@ from typing import List, Union, Tuple, Optional
 import numpy as np
 # from numpy.matrix import transpose
 import scipy.optimize
+from scipy.spatial import ConvexHull
 
 
 def potential(Xmesh: np.ndarray, Ymesh: np.ndarray, depth: Union[float, int], k: np.ndarray,
@@ -221,19 +222,20 @@ def potential_mask_site(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarray,
 
     # Calculate the Hessian matrix and its eigenvalues and eigenvectors
     h_mat = hessian_mat(site[0], site[1], depth, k, phis)
-    li, U = np.linalg.eig(h_mat)
-    li = np.abs(li[np.argsort(li)])
-    U = U[:, np.argsort(li)]
+    li, U = np.linalg.eigh(h_mat)
+    if not np.isfinite(li).all() or li[0] <= 0:
+        raise ValueError(f"Site {site} has a nonpositive or invalid Hessian; expected a minimum.")
 
     # Find the angle and lengths based on the eigenvectors and eigenvalues
-    theta = np.arctan2(U[0][1], U[0][0])
+    # r1 is the short axis: align it with the largest-curvature eigenvector.
+    theta = np.arctan2(U[1, -1], U[0, -1])
     w1 = np.sqrt(np.max(li))
     w2 = np.sqrt(np.min(li))
     length_ratio = np.sqrt(w2 / w1)
 
     # Create the mask and apply it to the potential matrix
     V_mask, mask = potential_mask_contour(Xmesh, Ymesh, V_mat, site, alpha, coef * length_ratio * mask_radius,
-                                          coef * mask_radius, -theta, depth, k, phis)
+                                          coef * mask_radius, theta, depth, k, phis)
 
     return V_mask, mask
 
@@ -273,7 +275,7 @@ def potential_mask_contour(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarr
 
     V_mask = np.copy(V_mat)
     mask = np.logical_and(mask_contour, mask_ellipse)
-    mask = 1 - mask
+    mask = ~mask
     V_mask[mask] = len(k) * depth
 
     return V_mask, mask
@@ -281,7 +283,7 @@ def potential_mask_contour(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarr
 
 def potential_mask_hull(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarray, sites: np.ndarray,
                         radius: float, depth: Union[float, int], k: np.ndarray, phis: np.ndarray,
-                        rings_list: List[np.ndarray] = [], hull_flag: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+                        rings_list: Optional[List[np.ndarray]] = None, hull_flag: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute the masked potential based on convex hulls around given sites.
 
@@ -300,8 +302,12 @@ def potential_mask_hull(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarray,
     Returns:
         Tuple[np.ndarray, np.ndarray]: Updated potential matrix with contour-based masking, Boolean mask matrix.
     """
+    sites = np.asarray(sites)
+    if (sites.ndim != 2 or sites.shape[1] != 2 or len(sites) < 3
+            or not np.isfinite(sites).all() or np.linalg.matrix_rank(sites - sites.mean(axis=0)) < 2):
+        raise ValueError("A local potential mask needs at least three non-collinear minima; increase cutoff.")
     masks = []
-    hull_object = scipy.spatial.ConvexHull(sites)
+    hull_object = ConvexHull(sites)
     hull = sites[hull_object.vertices, :]
     hull_center = np.array([np.mean(hull[:, 0]), np.mean(hull[:, 1])])
     hull_radii = np.sqrt(np.square(hull[:, 0] - hull_center[0]) + np.square(hull[:, 1] - hull_center[1]))
@@ -318,7 +324,7 @@ def potential_mask_hull(Xmesh: np.ndarray, Ymesh: np.ndarray, V_mat: np.ndarray,
                                            phis)
         masks.append(mask)
 
-    if len(rings_list) != 0:
+    if rings_list is not None and len(rings_list) != 0:
         for i_ring in range(len(rings_list)):
             ring_radius = 0.5
             V_mask_ring, mask_ring = potential_mask(Xmesh, Ymesh, V_mat, rings_list[i_ring], ring_radius, depth, k,
