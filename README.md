@@ -8,7 +8,7 @@ $$V(\mathbf r)=V_0\sum_{i=1}^{4}\cos^2(\mathbf k_i\cdot\mathbf r+\phi_i).$$
 
 ## Installation
 
-The CPU reference was verified with Python **3.9.6** and the versions pinned in `requirements.txt`. Use that Python version to reproduce the reference environment; upgrading dependencies is a separate numerical verification step.
+The reference was verified on CPU with Python **3.9.6** and the versions pinned in `requirements.txt`. The numerical Hamiltonian and eigensolver use PyTorch in float64; SciPy remains a dependency for optimization, integration, and saved sparse matrices.
 
 ```sh
 python3 -m venv .venv
@@ -21,17 +21,21 @@ python -m pip install -r requirements.txt
 The two positional arguments remain **depth and diameter**. The circular site selection uses half the diameter as its radius. This small example retains six sites:
 
 ```sh
-python quasi_hubbard.py 5 1.5 --spacing 0.2 --cutoff 1 --output-dir .reference/example
+python quasi_hubbard.py 5 1.5 --spacing 0.2 --cutoff 1 --device cpu --output-dir .reference/example
 ```
 
-This is a coarse regression case, not a converged physical prediction. The default spacing is `0.1`, the default cutoff is `4.0`, and execution defaults to one worker. Use `--workers 2` for two processes, or `--workers -1` for all available CPUs. Each worker holds a local Hamiltonian and eigensolver workspace, so increase concurrency with memory use in mind. Setting `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1` before starting Python avoids BLAS thread oversubscription during comparisons.
+This is a coarse regression case, not a converged physical prediction. The default spacing is `0.1`, the default cutoff is `4.0`, and execution defaults to one worker. `--device auto` selects CUDA when it is available and otherwise uses CPU. Use `--device cuda` on the intended NVIDIA machine; CUDA execution requires one worker. On CPU, use `--workers 2` for two processes or `--workers -1` for all available CPUs. Each worker holds a local Hamiltonian and eigensolver workspace, so increase concurrency with memory use in mind.
+
+Apple MPS is not used because this calculation preserves float64 numerical precision, which the tested MPS backend does not support. The MacBook therefore runs the PyTorch code on CPU; the same code selects CUDA on the future H100.
+
+The eigensolver allows up to 2,000 iterations per site and stops early on convergence. For harder cases, increase `--eigensolver-maxiter` (or `eigensolver_maxiter` in Python). The limit is recorded in checkpoint metadata; changing it requires a new output directory or `--fresh`. The eigenpair residual check still rejects unconverged results.
 
 Use `--plot` to save `lattice_sites_V.png`. Plotting is skipped by default. The same calculation is callable from Python:
 
 ```python
 from quasi_hubbard import run
 
-output = run(5.0, 1.5, spacing=0.2, cutoff=1.0, workers=1,
+output = run(5.0, 1.5, spacing=0.2, cutoff=1.0, workers=1, device="cpu",
              output_dir=".reference/example", plot=False)
 ```
 
@@ -68,7 +72,7 @@ Load `.npy` files with `numpy.load` and the sparse Hamiltonians with `scipy.spar
 
 ## Numerical scope and convergence
 
-The active solver uses a sparse sinc DVR operator, real float64 states and equal spacing in both directions. The grid-placement helper supports rectangular and complex arrays; this does not extend complex-state support to the full calculation. The unused finite-difference operator and alternative octagon convention remain outside the verified pipeline.
+The active solver constructs the sinc DVR Hamiltonian as a PyTorch sparse COO tensor and finds its lowest states with `torch.lobpcg`. It uses real float64 states and equal spacing in both directions. The grid-placement helper supports rectangular and complex arrays; this does not extend complex-state support to the full calculation. The old finite-difference and SciPy eigensolver paths have been removed.
 
 Minima must have positive Hessians and a scaled force residual $\|\nabla V\|/(V_0\max_i\|\mathbf k_i\|)\le10^{-5}$. A nominally successful minimization can fail that residual check; one tighter refinement is attempted. Conversely, a precision-loss status is accepted when the point passes the residual and curvature checks. Local masks require three non-collinear minima. Eigenpair residuals are checked against `1e-8` after scaling by `max(1, abs(eigenvalue))`. Each site has a deterministic eigensolver starting vector.
 
@@ -81,7 +85,8 @@ The Löwdin transform rejects nonpositive or numerically singular overlaps inste
 MPLBACKEND=Agg python check.py
 
 # Six-site physical regression, common-grid matrix checks, serial/parallel,
-# Python/CLI equivalence and interrupted checkpoints. Usually several seconds.
+# Python/CLI equivalence, interrupted checkpoints and a shallow-lattice solve.
+# CPU execution; usually tens of seconds.
 MPLBACKEND=Agg OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python check.py --physical
 
 # Independently inspect a small saved calculation on the union of local grids.
@@ -97,7 +102,7 @@ The original capture uses commit `5885c1d8c23c59ec5d55eb2f850da50ade28bb1d`, mod
 
 ## Code layout
 
-The six modules remain: `quasi_hubbard.py` for orchestration and checkpoints, `functions.py` for Wannier construction and matrix elements, `generate_lattice.py` for minima and configuration filtering, `potential_functions.py` for potentials and masks, `cont_schrod.py` for grids and discretization, and `spread_minimisation.py` for spread minimization. GPU acceleration is a subsequent step.
+The six modules remain: `quasi_hubbard.py` for orchestration and checkpoints, `functions.py` for Wannier construction and matrix elements, `generate_lattice.py` for minima and configuration filtering, `potential_functions.py` for potentials and masks, `cont_schrod.py` for grids and the PyTorch solver, and `spread_minimisation.py` for spread minimization.
 
 ## Authors and contributions
 

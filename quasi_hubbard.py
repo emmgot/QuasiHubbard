@@ -13,14 +13,14 @@ import numpy as np
 from joblib import Parallel, delayed
 from scipy.sparse import csc_matrix, hstack, issparse, load_npz, save_npz
 
-from cont_schrod import generate_grid
+from cont_schrod import DEFAULT_EIGENSOLVER_MAXITER, generate_grid, resolve_device
 from functions import (generate_wannier_function, compute_H, compute_S, compute_lowdin,
                        compute_U_iijj, compute_U_iiij, symmetric_orthogonalization)
 from generate_lattice import generate_sites, generate_octagon, clean_rings
 from potential_functions import potential
 
 # Bump when numerical conventions or checkpoint contents change.
-CALCULATION_VERSION = 3
+CALCULATION_VERSION = 5
 # A missing stage invalidates every later stage, before any computation starts.
 # ponytail: one ordered sequence; some independent stages are recomputed after a gap.
 STAGES = (
@@ -86,9 +86,9 @@ def plot_sites(output, params, candidates, sites):
     plt.close(fig)
 
 
-def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
-        plot=False, fresh=False):
-    """Run or resume a real, equal-spacing CPU calculation; return its output directory.
+def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, device="auto",
+        eigensolver_maxiter=DEFAULT_EIGENSOLVER_MAXITER, output_dir=None, plot=False, fresh=False):
+    """Run or resume a real, equal-spacing calculation; return its output directory.
 
     Lengths are in optical wavelengths and depth is in recoil energies. Only one
     process should write to a given output directory at a time.
@@ -104,6 +104,11 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
     depth, diameter, spacing, cutoff = (values[name] for name in ("depth", "diameter", "spacing", "cutoff"))
     if not isinstance(workers, int) or workers == 0 or workers < -1:
         raise ValueError("workers must be a positive integer, or -1 for all CPUs.")
+    if type(eigensolver_maxiter) is not int or eigensolver_maxiter < 1:
+        raise ValueError("eigensolver_maxiter must be a positive integer.")
+    device = resolve_device(device)
+    if device.startswith("cuda") and workers != 1:
+        raise ValueError("CUDA execution requires workers=1 to avoid duplicating GPU state.")
     x_window, y_window = generate_grid((0, 0), cutoff + 1.25, spacing)
     if len(x_window) < 2:
         raise ValueError("spacing is too large for the local window.")
@@ -115,9 +120,10 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
     phis = np.array([-2 * np.pi * delta_x, -2 * np.pi * delta_y,
                      -2 * np.pi * 1 / np.sqrt(2) * (delta_x + delta_y),
                      -2 * np.pi * 1 / np.sqrt(2) * (delta_x - delta_y)])
-    parameters = dict(values, k=k.tolist(), phis=phis.tolist())
+    parameters = dict(values, device=device, eigensolver_maxiter=eigensolver_maxiter,
+                      k=k.tolist(), phis=phis.tolist())
     versions = {name: importlib.metadata.version(name)
-                for name in ("numpy", "scipy", "matplotlib", "joblib")}
+                for name in ("numpy", "scipy", "matplotlib", "joblib", "torch")}
     try:
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"],
                                            cwd=Path(__file__).resolve().parent,
@@ -148,7 +154,8 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
 
     x_global, y_global = generate_grid((0, 0), diameter / 2 + cutoff + 0.5, spacing)
     params = dict(length=diameter, depth=depth, global_step=spacing, cut_off=cutoff,
-                  k=k, phis=phis, x_global=x_global, y_global=y_global, n_x=len(x_global))
+                  device=device, eigensolver_maxiter=eigensolver_maxiter, k=k, phis=phis,
+                  x_global=x_global, y_global=y_global, n_x=len(x_global))
     for name, value in (("phis", phis), ("x_window", x_window), ("y_window", y_window)):
         save_atomic(output / f"{name}.npy", value)
     times, reused = {}, []
@@ -264,7 +271,7 @@ def run(depth, diameter, *, spacing=0.1, cutoff=4.0, workers=1, output_dir=None,
                        max_crop_norm_loss=float(np.max(1 - retained_norms)))
     save_atomic(output / "summary.json", dict(sites=n_sites, local_grid=[len(x_window), len(y_window)],
                 stage_seconds=times, total_seconds=time.perf_counter() - started, reused_stages=reused,
-                workers=workers, diagnostics=diagnostics))
+                workers=workers, device=device, diagnostics=diagnostics))
     print(f"Löwdin crop: max overlap error {diagnostics['cropped_overlap_max_error']:.3g}, "
           f"max norm loss {diagnostics['max_crop_norm_loss']:.3g}", flush=True)
     if plot:
@@ -279,6 +286,9 @@ def main():
     parser.add_argument("--spacing", type=float, default=0.1)
     parser.add_argument("--cutoff", type=float, default=4.0)
     parser.add_argument("--workers", type=int, default=1, help="worker count; -1 uses all CPUs")
+    parser.add_argument("--device", default="auto", help="calculation device: auto, cpu, cuda or cuda:N")
+    parser.add_argument("--eigensolver-maxiter", type=int, default=DEFAULT_EIGENSOLVER_MAXITER,
+                        help="maximum LOBPCG iterations per site (default: %(default)s)")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plot", action="store_true", help="save a lattice potential plot")
     parser.add_argument("--fresh", action="store_true", help="discard this directory's calculation checkpoints")

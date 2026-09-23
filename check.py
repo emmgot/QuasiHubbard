@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 
 ORIGINAL_COMMIT = "5885c1d8c23c59ec5d55eb2f850da50ade28bb1d"
-CASE = dict(depth=5.0, diameter=1.5, spacing=0.2, cutoff=1.0)
+CASE = dict(depth=5.0, diameter=1.5, spacing=0.2, cutoff=1.0, device="cpu")
 
 
 def capture_original(output):
@@ -72,7 +72,7 @@ def capture_original(output):
 
 
 def check_imports_and_grid():
-    from cont_schrod import generate_grid, shift_to_global_grid, hamiltonian, laplacian_DVR
+    from cont_schrod import generate_grid, shift_to_global_grid, hamiltonian
     from functions import dot_states
     from generate_lattice import clean_lattice_sites
 
@@ -103,11 +103,9 @@ def check_imports_and_grid():
         shift_to_global_grid(rectangular, np.arange(3) + 0.1, np.arange(2), np.arange(3), np.arange(2))
     with np.testing.assert_raises(ValueError):
         generate_grid((0, 0), 1, 0)
-    with np.testing.assert_raises(ValueError):
-        laplacian_DVR(3, 2, 0.1, 0.2)
     assert clean_lattice_sites([]).shape == (0, 2)
     np.testing.assert_array_equal(clean_lattice_sites([[0, 1]]), [[0, 1]])
-    H, _, _ = hamiltonian(np.arange(3) * 0.2, np.arange(2) * 0.2, np.zeros((2, 3)))
+    H = hamiltonian(np.arange(3) * 0.2, np.arange(2) * 0.2, np.zeros((2, 3)), "cpu")
     # Independent separable DVR construction checks signs, flattening and boundary couplings.
     def kinetic(n):
         delta = np.arange(n)[:, None] - np.arange(n)[None, :]
@@ -115,7 +113,7 @@ def check_imports_and_grid():
         np.fill_diagonal(result, 1 / (12 * 0.2 ** 2))
         return result
     expected = np.kron(np.eye(2), kinetic(3)) + np.kron(kinetic(2), np.eye(3))
-    np.testing.assert_allclose(H.toarray(), expected, atol=1e-14)
+    np.testing.assert_allclose(H.to_dense().numpy(), expected, atol=1e-14)
 
 
 def check_masks():
@@ -178,6 +176,36 @@ def check_lowdin():
             symmetric_orthogonalization(S)
 
 
+def check_torch():
+    import torch
+    from cont_schrod import hamiltonian, lowest_eigenstates, resolve_device
+
+    x, y = np.arange(4) * 0.2, np.arange(3) * 0.2
+    potential = np.arange(12).reshape(3, 4) / 10
+    def kinetic(n):
+        delta = np.arange(n)[:, None] - np.arange(n)[None, :]
+        result = 2 * (-1.) ** delta / (4 * np.pi ** 2 * 0.2 ** 2
+                                       * np.where(delta == 0, 1, delta) ** 2)
+        np.fill_diagonal(result, 1 / (12 * 0.2 ** 2))
+        return result
+
+    expected = (np.kron(np.eye(3), kinetic(4)) + np.kron(kinetic(3), np.eye(4))
+                + np.diag(potential.reshape(-1)))
+    actual = hamiltonian(x, y, potential, "cpu").to_dense().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-14)
+    for device in (["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]):
+        values, vectors = lowest_eigenstates(x, y, potential, 2, seed=7, device=device)
+        np.testing.assert_allclose(values, np.linalg.eigvalsh(expected)[:2], rtol=1e-10, atol=1e-10)
+        residual = np.linalg.norm(expected @ vectors - vectors * values, axis=0) / np.maximum(1, np.abs(values))
+        assert residual.max() < 1e-8
+    for maxiter in (0, -1, 1.5, True):
+        with np.testing.assert_raises(ValueError):
+            lowest_eigenstates(x, y, potential, 2, seed=7, device="cpu", maxiter=maxiter)
+    assert resolve_device("cpu") == "cpu"
+    with np.testing.assert_raises(ValueError):
+        resolve_device("mps")
+
+
 def inspect_physical(output):
     """Compare local representations with an independently assembled common grid."""
     from scipy.sparse import load_npz
@@ -205,9 +233,13 @@ def inspect_physical(output):
     np.testing.assert_allclose(pair_density, np.load(output / "U_iijj.npy"), atol=1e-13)
     np.testing.assert_allclose(lowdin.T @ (lowdin ** 3) * spacing ** 2, np.load(output / "U_iiij.npy"), atol=1e-13)
     X, Y = np.meshgrid(x, y)
-    H, _, _ = hamiltonian(x, y, potential(X, Y, params["depth"], np.array(params["k"]), np.array(params["phis"])))
-    common_H = basis.T @ (H @ basis) * spacing ** 2
-    actual_H = lowdin.T @ (H @ lowdin) * spacing ** 2
+    H = hamiltonian(x, y, potential(X, Y, params["depth"], np.array(params["k"]),
+                                    np.array(params["phis"])), "cpu")
+    import torch
+    H_basis = torch.sparse.mm(H, torch.as_tensor(basis, dtype=torch.float64)).numpy()
+    H_lowdin = torch.sparse.mm(H, torch.as_tensor(lowdin, dtype=torch.float64)).numpy()
+    common_H = basis.T @ H_basis * spacing ** 2
+    actual_H = lowdin.T @ H_lowdin * spacing ** 2
     np.testing.assert_allclose(common_H, common_H.T, atol=1e-13)
     metrics = dict(common_grid_H_max_difference=float(np.max(np.abs(common_H - load_npz(output / "hamiltonian_wannier.npz").toarray()))),
                    cropped_H_max_difference=float(np.max(np.abs(actual_H - load_npz(output / "hamiltonian_real.npz").toarray()))),
@@ -250,6 +282,8 @@ def check_physical():
         assert mtimes == {name: (output / name).stat().st_mtime_ns for name in reference}
         with np.testing.assert_raises(ValueError):
             driver.run(**dict(CASE, depth=5.00000001), output_dir=output)
+        with np.testing.assert_raises(ValueError):
+            driver.run(**CASE, eigensolver_maxiter=3000, output_dir=output)
         legacy = Path(directory) / "legacy"
         legacy.mkdir()
         np.save(legacy / "S_matrix.npy", np.eye(6))
@@ -290,12 +324,26 @@ def check_physical():
         driver.run(**CASE, output_dir=output)
         compare(reference, arrays(output))
 
-        parallel = driver.run(**CASE, workers=2, output_dir=Path(directory) / "parallel")
+        # CPU regression must stay on CPU even on a CUDA host.
+        with patch("torch.cuda.is_available", return_value=True):
+            parallel = driver.run(**CASE, workers=2, output_dir=Path(directory) / "parallel")
         compare(reference, arrays(parallel))
         cli = Path(directory) / "cli"
         subprocess.run([sys.executable, "quasi_hubbard.py", "5", "1.5", "--spacing", "0.2",
-                        "--cutoff", "1", "--output-dir", str(cli)], check=True)
+                        "--cutoff", "1", "--device", "cpu", "--eigensolver-maxiter", "2000",
+                        "--output-dir", str(cli)], check=True)
         compare(reference, arrays(cli))
+        assert json.loads((cli / "metadata.json").read_text())["parameters"]["device"] == "cpu"
+
+        # This shallow lattice needs more than the old 500-iteration limit.
+        shallow = dict(CASE, depth=0.1, spacing=0.1)
+        short = Path(directory) / "shallow-short"
+        with np.testing.assert_raises_regex(ValueError, "Eigensolver residual too large"):
+            driver.run(**shallow, eigensolver_maxiter=500, output_dir=short)
+        assert not (short / "wannier_functions.npy").exists()
+        converged = driver.run(**shallow, output_dir=Path(directory) / "shallow")
+        assert np.isfinite(np.load(converged / "wannier_functions.npy")).all()
+        assert (converged / "summary.json").is_file()
     print("Six-site CPU, serial/parallel, CLI and interrupted-restart checks passed.")
 
 
@@ -313,6 +361,7 @@ if __name__ == "__main__":
         check_imports_and_grid()
         check_masks()
         check_lowdin()
+        check_torch()
         if args.physical:
             check_physical()
         print("Checks passed.")
